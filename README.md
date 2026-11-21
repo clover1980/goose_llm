@@ -12,6 +12,17 @@ Because Goose stores arrays inline on its compiler-managed data stacks and suppo
   
   3. Standalone Execution: Runs completely offline directly from a .bin weights file and tokenizer.bin.
 
+# Download Checkpoint + Tokenizer & Run It!
+Run these commands in `~/` to download both `stories15M.bin` and `tokenizer.bin`, compile with OpenMP + AVX2, and watch your llm generate a story:
+
+    cd ~
+    wget -q https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin -O stories15M.bin
+    wget -q https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin -O tokenizer.bin
+
+    goose -o goose_llm.c goose_llm.goose
+    gcc -O3 -march=native -fopenmp -include llm_loader.h goose_llm.c -lm -o goose_llm
+    ./goose_llm
+
 # License
     Idea: mine.
     Execution: GOOGLE Ai Machine generated code.
