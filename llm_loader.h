@@ -58,12 +58,14 @@ static RunState g_s;
 static char **g_vocab = NULL;
 static float *g_vocab_scores = NULL;
 static int g_max_token_length = 0;
+static int *g_prompt_tokens = NULL;
+static int g_num_prompt_tokens = 0;
 
 void memory_map_weights(TransformerWeights *w, Config *p, float *ptr, int shared_weights) {
     int head_size = p->dim / p->n_heads;
-    unsigned long long n_layers = p->n_layers;
+    size_t n_layers = p->n_layers;
     w->token_embedding_table = ptr;
-    ptr += p->vocab_size * p->dim;
+    ptr += (size_t)p->vocab_size * p->dim;
     w->rms_att_weight = ptr;
     ptr += n_layers * p->dim;
     w->wq = ptr;
@@ -84,8 +86,8 @@ void memory_map_weights(TransformerWeights *w, Config *p, float *ptr, int shared
     ptr += n_layers * p->dim * p->hidden_dim;
     w->rms_final_weight = ptr;
     ptr += p->dim;
-    ptr += p->seq_len * head_size / 2;
-    ptr += p->seq_len * head_size / 2;
+    ptr += (size_t)p->seq_len * head_size / 2;
+    ptr += (size_t)p->seq_len * head_size / 2;
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
@@ -93,7 +95,10 @@ int init_transformer(const char *ckpt_path, const char *tok_path) {
     int fd = open(ckpt_path, O_RDONLY);
     if (fd < 0) { printf("[Error] Cannot open %s\n", ckpt_path); return 0; }
     struct stat st;
-    fstat(fd, &st);
+    if (fstat(fd, &st) < 0 || (size_t)st.st_size < sizeof(Config)) {
+        close(fd);
+        return 0;
+    }
     void *data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (data == MAP_FAILED) return 0;
@@ -273,4 +278,83 @@ void print_perf_stats(int tokens, long start_ms) {
     }
 }
 
+static int str_lookup(const char *str, char **vocab, int vocab_size) {
+    for (int i = 0; i < vocab_size; i++) {
+        if (strcmp(str, vocab[i]) == 0) return i;
+    }
+    return -1;
+}
+
+int encode_user_prompt(const char *text) {
+    if (g_prompt_tokens) { free(g_prompt_tokens); g_prompt_tokens = NULL; }
+
+    if (!text || text[0] == '\0') {
+        g_prompt_tokens = malloc(sizeof(int));
+        g_prompt_tokens[0] = 1;
+        g_num_prompt_tokens = 1;
+Use code with caution.
+return 1;
+}
+size_t len = strlen(text);
+g_prompt_tokens = malloc((len + 4) * sizeof(int));
+char *str_buffer = malloc((g_max_token_length * 2 + 4) * sizeof(char));
+int n_tokens = 0;
+g_prompt_tokens[n_tokens++] = 1;
+if (text[0] != ' ') {
+int space_id = str_lookup(" ", g_vocab, g_cfg.vocab_size);
+if (space_id != -1) g_prompt_tokens[n_tokens++] = space_id;
+}
+size_t str_len = 0;
+for (const char *c = text; *c != '\0'; c++) {
+if ((*c & 0xC0) != 0x80) str_len = 0;
+str_buffer[str_len++] = *c;
+str_buffer[str_len] = '\0';
+if ((*(c + 1) & 0xC0) == 0x80 && str_len < 4) continue;
+int id = str_lookup(str_buffer, g_vocab, g_cfg.vocab_size);
+if (id != -1) {
+g_prompt_tokens[n_tokens++] = id;
+} else {
+for (size_t i = 0; i < str_len; i++) {
+char byte_tok[8];
+snprintf(byte_tok, sizeof(byte_tok), "<0x%02X>", (unsigned char)str_buffer[i]);
+int bid = str_lookup(byte_tok, g_vocab, g_cfg.vocab_size);
+if (bid != -1) g_prompt_tokens[n_tokens++] = bid;
+}
+}
+str_len = 0;
+}
+while (1) {
+float best_score = -1e10f;
+int best_id = -1;
+int best_idx = -1;
+for (int i = 0; i < n_tokens - 1; i++) {
+snprintf(str_buffer, g_max_token_length * 2 + 2, "%s%s",
+g_vocab[g_prompt_tokens[i]], g_vocab[g_prompt_tokens[i + 1]]);
+int id = str_lookup(str_buffer, g_vocab, g_cfg.vocab_size);
+if (id != -1 && g_vocab_scores[id] > best_score) {
+best_score = g_vocab_scores[id];
+best_id = id;
+best_idx = i;
+}
+}
+if (best_idx == -1) break;
+g_prompt_tokens[best_idx] = best_id;
+for (int i = best_idx + 1; i < n_tokens - 1; i++) {
+g_prompt_tokens[i] = g_prompt_tokens[i + 1];
+}
+n_tokens--;
+}
+free(str_buffer);
+g_num_prompt_tokens = n_tokens;
+return n_tokens;
+}
+int get_prompt_token(int idx) {
+if (idx >= 0 && idx < g_num_prompt_tokens) return g_prompt_tokens[idx];
+return 1;
+}
+const char* get_cli_prompt(void) {
+const char *env_p = getenv("PROMPT");
+if (env_p && env_p[0] != '\0') return env_p;
+return "Once upon a time on a giant server with 768 gigabytes of memory,";
+}
 #endif // LLM_LOADER_H
