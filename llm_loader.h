@@ -355,6 +355,6 @@ return 1;
 const char* get_cli_prompt(void) {
 const char *env_p = getenv("PROMPT");
 if (env_p && env_p[0] != '\0') return env_p;
-return "Once upon a time on a giant server with 768 gigabytes of memory,";
+return "Once upon a time on a giant server with million gigabytes of memory,";
 }
 #endif // LLM_LOADER_H
