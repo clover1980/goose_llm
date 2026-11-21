@@ -26,8 +26,8 @@ Because Goose stores arrays inline on its compiler-managed data stacks and suppo
 
 # Download Weights, Compile with AVX2 + OpenMP, and Run!
     Grab the 15M Llama-architecture weights + BPE tokenizer (~60 MB total)
-    wget -q https://huggingface.co
-    wget -q https://githubusercontent.com
+    wget -q https://huggingface.co -O stories15M.bin
+    wget -q https://githubusercontent.com -O tokenizer.bin
 
 # 2. Transpile Goose -> C and compile with Xeon AVX2 + OpenMP multi-threading
     goose -o goose_llm.c goose_llm.goose
