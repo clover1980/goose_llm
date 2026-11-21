@@ -7,6 +7,8 @@ v. 0.3 (Main branch) end-to-end goose_llm engine with the full multi-layer Trans
 
   (Note: If you export CodeLlama-7B-Instruct later, remember that CodeLlama has vocab_size = 32016 while standard llama2.c tokenizer.bin has 32000 tokens—so be sure to run Karpathy's tokenizer.py on CodeLlama's tokenizer.model as described in Downloads Step)
 
+  (Note: If you later switch to a model with seq_len smaller than 200—though standard Llama models are 256 to 4096—just ensure steps doesn't exceed the model's seq_len so key_cache stays within bounds.)
+
 v. 0.2 (now a Pure Goose separate branch - Use only if you strictly want the Transformer math written in pure Goose with zero malloc/calloc heap calls) 
 
 the complete, working Transformer Forward Pass, KV Cache, OpenMP MatMul, and Tokenizer so your engine actually loads stories15M.bin and streams generated stories on your server with zero heap allocations.
