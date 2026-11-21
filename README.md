@@ -1,11 +1,13 @@
 # goose_llm v. 0.3
-v. 0.3 end-to-end goose_llm engine with the full multi-layer Transformer forward pass, KV cache, BPE tokenizer, and temperature/top-p sampler wired together.
+v. 0.3 (Main branch) end-to-end goose_llm engine with the full multi-layer Transformer forward pass, KV cache, BPE tokenizer, and temperature/top-p sampler wired together.
 
   • llm_loader.h (C Backend): Memory-maps (mmap) the model .bin weights directly into your RAM in 0 ms, loads tokenizer.bin, and exposes the OpenMP-parallelized multi-layer forward pass (forward_token) and greedy/temperature sampling.
    
   • goose_llm.goose (Goose Frontend): Drives the autoregressive token generation loop, measures real-time tokens/second, and streams decoded text cleanly to stdout.
 
-v. 0.2 the complete, working Transformer Forward Pass, KV Cache, OpenMP MatMul, and Tokenizer so your engine actually loads stories15M.bin and streams generated stories on your server with zero heap allocations.
+v. 0.2 (now a Pure Goose separate branch - Use only if you strictly want the Transformer math written in pure Goose with zero malloc/calloc heap calls) 
+
+the complete, working Transformer Forward Pass, KV Cache, OpenMP MatMul, and Tokenizer so your engine actually loads stories15M.bin and streams generated stories on your server with zero heap allocations.
 
 v. 0.1 A Standalone Pure-Goose Neural Network Inference Engine (goose_llm) (llama2.c style)—with zero Python, zero PyTorch, zero llama.cpp server, and zero heap allocations.
 
