@@ -1,4 +1,6 @@
-# goose_llm v. 0.3
+# goose_llm v. 0.4
+v. 0.4 (Main branch) full BPE Prompt Encoding (bpe_encode) so you can pass any custom text prompt from the terminal (e.g., ./goose_llm "Once upon a time"), feeding your prompt tokens through the KV cache before generating the continuation.
+
 v. 0.3 (Main branch) end-to-end goose_llm engine with the full multi-layer Transformer forward pass, KV cache, BPE tokenizer, and temperature/top-p sampler wired together.
 
   • llm_loader.h (C Backend): Memory-maps (mmap) the model .bin weights directly into your RAM in 0 ms, loads tokenizer.bin, and exposes the OpenMP-parallelized multi-layer forward pass (forward_token) and greedy/temperature sampling.
