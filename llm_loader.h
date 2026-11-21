@@ -5,8 +5,10 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
@@ -18,93 +20,236 @@ typedef struct {
     int n_kv_heads;
     int vocab_size;
     int seq_len;
-} ModelConfig;
+} Config;
 
-static ModelConfig g_cfg;
-static float *g_weights_ptr = NULL;
-static size_t g_file_size = 0;
+typedef struct {
+    float *token_embedding_table;
+    float *rms_att_weight;
+    float *rms_ffn_weight;
+    float *wq;
+    float *wk;
+    float *wv;
+    float *wo;
+    float *w1;
+    float *w2;
+    float *w3;
+    float *rms_final_weight;
+    float *wcls;
+} TransformerWeights;
 
-// Static tokenizer table (32,000 tokens * 64 chars max = ~2MB BSS, zero heap)
-#define MAX_VOCAB 32000
-#define MAX_TOK_LEN 64
-static char g_vocab[MAX_VOCAB][MAX_TOK_LEN];
-static float g_vocab_scores[MAX_VOCAB];
+typedef struct {
+    float *x;
+    float *xb;
+    float *xb2;
+    float *hb;
+    float *hb2;
+    float *q;
+    float *k;
+    float *v;
+    float *att;
+    float *logits;
+    float *key_cache;
+    float *value_cache;
+} RunState;
+
+static Config g_cfg;
+static TransformerWeights g_w;
+static RunState g_s;
+static char **g_vocab = NULL;
+static float *g_vocab_scores = NULL;
 static int g_max_token_length = 0;
 
-int mmap_checkpoint(const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
+void memory_map_weights(TransformerWeights *w, Config *p, float *ptr, int shared_weights) {
+    int head_size = p->dim / p->n_heads;
+    unsigned long long n_layers = p->n_layers;
+    w->token_embedding_table = ptr;
+    ptr += p->vocab_size * p->dim;
+    w->rms_att_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->wq = ptr;
+    ptr += n_layers * p->dim * (p->n_heads * head_size);
+    w->wk = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wv = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wo = ptr;
+    ptr += n_layers * (p->n_heads * head_size) * p->dim;
+    w->rms_ffn_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->w1 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->w2 = ptr;
+    ptr += n_layers * p->hidden_dim * p->dim;
+    w->w3 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->rms_final_weight = ptr;
+    ptr += p->dim;
+    ptr += p->seq_len * head_size / 2;
+    ptr += p->seq_len * head_size / 2;
+    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+}
 
+int init_transformer(const char *ckpt_path, const char *tok_path) {
+    int fd = open(ckpt_path, O_RDONLY);
+    if (fd < 0) { printf("[Error] Cannot open %s\n", ckpt_path); return 0; }
     struct stat st;
-    if (fstat(fd, &st) < 0 || (size_t)st.st_size < sizeof(ModelConfig)) {
-        close(fd);
-        return 0;
-    }
-    g_file_size = st.st_size;
-
-    void *data = mmap(NULL, g_file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    fstat(fd, &st);
+    void *data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (data == MAP_FAILED) return 0;
 
-    memcpy(&g_cfg, data, sizeof(ModelConfig));
-    g_weights_ptr = (float *)((char *)data + sizeof(ModelConfig));
-    printf("[Goose-LLM] Mapped %.2f MB weights | dim=%d layers=%d heads=%d vocab=%d\n",
-           g_file_size / 1048576.0, g_cfg.dim, g_cfg.n_layers, g_cfg.n_heads, abs(g_cfg.vocab_size));
-    return 1;
-}
+    memcpy(&g_cfg, data, sizeof(Config));
+    int shared_weights = g_cfg.vocab_size > 0 ? 1 : 0;
+    g_cfg.vocab_size = abs(g_cfg.vocab_size);
+    memory_map_weights(&g_w, &g_cfg, (float *)((char *)data + sizeof(Config)), shared_weights);
 
-int load_tokenizer(const char *path, int vocab_size) {
-    FILE *file = fopen(path, "rb");
-    if (!file) return 0;
-    if (fread(&g_max_token_length, sizeof(int), 1, file) != 1) { fclose(file); return 0; }
-    int v = abs(vocab_size);
-    if (v > MAX_VOCAB) v = MAX_VOCAB;
-    for (int i = 0; i < v; i++) {
+    int kv_dim = (g_cfg.dim * g_cfg.n_kv_heads) / g_cfg.n_heads;
+    g_s.x = calloc(g_cfg.dim, sizeof(float));
+    g_s.xb = calloc(g_cfg.dim, sizeof(float));
+    g_s.xb2 = calloc(g_cfg.dim, sizeof(float));
+    g_s.hb = calloc(g_cfg.hidden_dim, sizeof(float));
+    g_s.hb2 = calloc(g_cfg.hidden_dim, sizeof(float));
+    g_s.q = calloc(g_cfg.dim, sizeof(float));
+    g_s.key_cache = calloc((size_t)g_cfg.n_layers * g_cfg.seq_len * kv_dim, sizeof(float));
+    g_s.value_cache = calloc((size_t)g_cfg.n_layers * g_cfg.seq_len * kv_dim, sizeof(float));
+    g_s.att = calloc((size_t)g_cfg.n_heads * g_cfg.seq_len, sizeof(float));
+    g_s.logits = calloc(g_cfg.vocab_size, sizeof(float));
+
+    FILE *tf = fopen(tok_path, "rb");
+    if (!tf) { printf("[Error] Cannot open %s\n", tok_path); return 0; }
+    fread(&g_max_token_length, sizeof(int), 1, tf);
+    g_vocab = malloc(g_cfg.vocab_size * sizeof(char *));
+    g_vocab_scores = malloc(g_cfg.vocab_size * sizeof(float));
+    for (int i = 0; i < g_cfg.vocab_size; i++) {
         int len = 0;
-        if (fread(&g_vocab_scores[i], sizeof(float), 1, file) != 1) break;
-        if (fread(&len, sizeof(int), 1, file) != 1) break;
-        if (len >= MAX_TOK_LEN) len = MAX_TOK_LEN - 1;
-        fread(g_vocab[i], 1, len, file);
+        fread(&g_vocab_scores[i], sizeof(float), 1, tf);
+        fread(&len, sizeof(int), 1, tf);
+        g_vocab[i] = malloc(len + 1);
+        fread(g_vocab[i], len, 1, tf);
         g_vocab[i][len] = '\0';
     }
-    fclose(file);
+    fclose(tf);
+    printf("\x1b[1;32m[Goose-LLM] Loaded %.2f MB | dim=%d layers=%d heads=%d vocab=%d\x1b[0m\n\n",
+           st.st_size / 1048576.0, g_cfg.dim, g_cfg.n_layers, g_cfg.n_heads, g_cfg.vocab_size);
     return 1;
 }
 
-// Config getters for Goose
-int get_dim(void)        { return g_cfg.dim; }
-int get_hidden_dim(void) { return g_cfg.hidden_dim; }
-int get_n_layers(void)   { return g_cfg.n_layers; }
-int get_n_heads(void)    { return g_cfg.n_heads; }
-int get_n_kv_heads(void) { return g_cfg.n_kv_heads; }
-int get_vocab_size(void) { return abs(g_cfg.vocab_size); }
-int get_seq_len(void)    { return g_cfg.seq_len; }
-int is_shared_weights(void) { return g_cfg.vocab_size > 0 ? 1 : 0; }
+static void c_rmsnorm(float *o, float *x, float *weight, int size) {
+    float ss = 0.0f;
+    for (int j = 0; j < size; j++) ss += x[j] * x[j];
+    ss /= size;
+    ss += 1e-5f;
+    ss = 1.0f / sqrtf(ss);
+    for (int j = 0; j < size; j++) o[j] = weight[j] * (ss * x[j]);
+}
 
-// OpenMP multi-core Xeon MatMul reading directly from mmap'd weights at offset
-void fast_matmul_offset(float *xout, const float *x, int64_t weight_offset, int n, int d) {
-    const float *w = g_weights_ptr + weight_offset;
-    #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
+static void c_softmax(float *x, int size) {
+    float max_val = x[0];
+    for (int i = 1; i < size; i++) if (x[i] > max_val) max_val = x[i];
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) { x[i] = expf(x[i] - max_val); sum += x[i]; }
+    for (int i = 0; i < size; i++) x[i] /= sum;
+}
+
+static void c_matmul(float *xout, float *x, float *w, int n, int d) {
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
         float val = 0.0f;
-        const float *row = w + (int64_t)i * n;
-        for (int j = 0; j < n; j++) {
-            val += row[j] * x[j];
-        }
+        for (int j = 0; j < n; j++) val += w[(size_t)i * n + j] * x[j];
         xout[i] = val;
     }
 }
 
-void copy_weight_slice(float *dst, int64_t weight_offset, int count) {
-    memcpy(dst, g_weights_ptr + weight_offset, (size_t)count * sizeof(float));
+int forward_and_sample(int token, int pos) {
+    Config *p = &g_cfg;
+    TransformerWeights *w = &g_w;
+    RunState *s = &g_s;
+    float *x = s->x;
+    int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    int hidden_dim = p->hidden_dim;
+    int head_size = dim / p->n_heads;
+
+    memcpy(x, w->token_embedding_table + (size_t)token * dim, dim * sizeof(float));
+
+    for (int l = 0; l < p->n_layers; l++) {
+        c_rmsnorm(s->xb, x, w->rms_att_weight + (size_t)l * dim, dim);
+        size_t loff = (size_t)l * p->seq_len * kv_dim;
+        s->k = s->key_cache + loff + (size_t)pos * kv_dim;
+        s->v = s->value_cache + loff + (size_t)pos * kv_dim;
+
+        c_matmul(s->q, s->xb, w->wq + (size_t)l * dim * dim, dim, dim);
+        c_matmul(s->k, s->xb, w->wk + (size_t)l * dim * kv_dim, dim, kv_dim);
+        c_matmul(s->v, s->xb, w->wv + (size_t)l * dim * kv_dim, dim, kv_dim);
+
+        for (int i = 0; i < dim; i += 2) {
+            int head_dim = i % head_size;
+            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            float val = pos * freq;
+            float fcr = cosf(val), fci = sinf(val);
+            int rotn = i < kv_dim ? 2 : 1;
+            for (int v = 0; v < rotn; v++) {
+                float *vec = v == 0 ? s->q : s->k;
+                float v0 = vec[i], v1 = vec[i + 1];
+                vec[i] = v0 * fcr - v1 * fci;
+                vec[i + 1] = v0 * fci + v1 * fcr;
+            }
+        }
+
+        int h;
+        #pragma omp parallel for private(h)
+        for (h = 0; h < p->n_heads; h++) {
+            float *q = s->q + h * head_size;
+            float *att = s->att + (size_t)h * p->seq_len;
+            for (int t = 0; t <= pos; t++) {
+                float *k = s->key_cache + loff + (size_t)t * kv_dim + (h / kv_mul) * head_size;
+                float score = 0.0f;
+                for (int i = 0; i < head_size; i++) score += q[i] * k[i];
+                att[t] = score / sqrtf(head_size);
+            }
+            c_softmax(att, pos + 1);
+            float *xb = s->xb + h * head_size;
+            memset(xb, 0, head_size * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                float *v = s->value_cache + loff + (size_t)t * kv_dim + (h / kv_mul) * head_size;
+                float a = att[t];
+                for (int i = 0; i < head_size; i++) xb[i] += a * v[i];
+            }
+        }
+
+        c_matmul(s->xb2, s->xb, w->wo + (size_t)l * dim * dim, dim, dim);
+        for (int i = 0; i < dim; i++) x[i] += s->xb2[i];
+
+        c_rmsnorm(s->xb, x, w->rms_ffn_weight + (size_t)l * dim, dim);
+        c_matmul(s->hb, s->xb, w->w1 + (size_t)l * dim * hidden_dim, dim, hidden_dim);
+        c_matmul(s->hb2, s->xb, w->w3 + (size_t)l * dim * hidden_dim, dim, hidden_dim);
+
+        for (int i = 0; i < hidden_dim; i++) {
+            float val = s->hb[i];
+            val *= (1.0f / (1.0f + expf(-val)));
+            val *= s->hb2[i];
+            s->hb[i] = val;
+        }
+        c_matmul(s->xb, s->hb, w->w2 + (size_t)l * dim * hidden_dim, hidden_dim, dim);
+        for (int i = 0; i < dim; i++) x[i] += s->xb[i];
+    }
+
+    c_rmsnorm(x, x, w->rms_final_weight, dim);
+    c_matmul(s->logits, x, w->wcls, dim, p->vocab_size);
+
+    int max_i = 0;
+    float max_p = s->logits[0];
+    for (int i = 1; i < p->vocab_size; i++) {
+        if (s->logits[i] > max_p) { max_i = i; max_p = s->logits[i]; }
+    }
+    return max_i;
 }
 
-void print_token(int prev_token, int token) {
-    if (token < 0 || token >= MAX_VOCAB) return;
+void print_decoded_token(int prev_token, int token) {
     char *piece = g_vocab[token];
-    // Strip leading space after BOS token (1)
     if (prev_token == 1 && piece[0] == ' ') piece++;
-    // Handle raw byte tokens like <0x0A>
     unsigned char byte_val;
     if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
         putchar(byte_val);
@@ -112,6 +257,20 @@ void print_token(int prev_token, int token) {
         printf("%s", piece);
     }
     fflush(stdout);
+}
+
+long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+void print_perf_stats(int tokens, long start_ms) {
+    long elapsed = now_ms() - start_ms;
+    if (elapsed > 0) {
+        printf("\n\n\x1b[1;33m[Perf] Generated %d tokens in %.2fs (%.1f tokens/sec on Xeon AVX2)\x1b[0m\n",
+               tokens, elapsed / 1000.0, (tokens * 1000.0) / elapsed);
+    }
 }
 
 #endif // LLM_LOADER_H
