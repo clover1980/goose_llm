@@ -5,6 +5,8 @@ v. 0.3 (Main branch) end-to-end goose_llm engine with the full multi-layer Trans
    
   • goose_llm.goose (Goose Frontend): Drives the autoregressive token generation loop, measures real-time tokens/second, and streams decoded text cleanly to stdout.
 
+  (Note: If you export CodeLlama-7B-Instruct later, remember that CodeLlama has vocab_size = 32016 while standard llama2.c tokenizer.bin has 32000 tokens—so be sure to run Karpathy's tokenizer.py on CodeLlama's tokenizer.model as described in Downloads Step)
+
 v. 0.2 (now a Pure Goose separate branch - Use only if you strictly want the Transformer math written in pure Goose with zero malloc/calloc heap calls) 
 
 the complete, working Transformer Forward Pass, KV Cache, OpenMP MatMul, and Tokenizer so your engine actually loads stories15M.bin and streams generated stories on your server with zero heap allocations.
@@ -20,15 +22,16 @@ Because Goose stores arrays inline on its compiler-managed data stacks and suppo
   
   3. Standalone Execution: Runs completely offline directly from a .bin weights file and tokenizer.bin.
 
-# Download Checkpoint + Tokenizer & Run It!
-Run these commands in `~/` to download both `stories15M.bin` and `tokenizer.bin`, compile with OpenMP + AVX2, and watch your llm generate a story:
+# Download Weights, Compile with AVX2 + OpenMP, and Run!
+    Grab the 15M Llama-architecture weights + BPE tokenizer (~60 MB total)
+    wget -q https://huggingface.co
+    wget -q https://githubusercontent.com
 
-    cd ~
-    wget -q https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin -O stories15M.bin
-    wget -q https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin -O tokenizer.bin
-
+# 2. Transpile Goose -> C and compile with Xeon AVX2 + OpenMP multi-threading
     goose -o goose_llm.c goose_llm.goose
     gcc -O3 -march=native -fopenmp -include llm_loader.h goose_llm.c -lm -o goose_llm
+
+# 3. Run standalone native inference!
     ./goose_llm
 
 # License
